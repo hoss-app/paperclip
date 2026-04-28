@@ -1,0 +1,240 @@
+# ====================================================================
+#  Deploy paperclip to AWS — Docker → ECR → SSM to EC2
+# ====================================================================
+#  Pattern mirrors hoss-app/in-app `deploy-app.yml`:
+#    1. Docker buildx (linux/arm64 — t4g.small target)
+#    2. Push to ECR with :main-latest + :main-<sha>
+#    3. aws ssm send-command on the EC2:
+#         - ECR login
+#         - Write /home/ubuntu/paperclip/docker-compose.yml (idempotent)
+#         - Fetch DB + auth secrets via instance profile, build env
+#         - cloudflared service install (first run only, with token from
+#           Secrets Manager)
+#         - docker pull + docker compose up -d --force-recreate
+#         - docker image prune -f
+#
+#  Trigger: workflow_dispatch only by default. Flip to `push: branches: [master]`
+#  once you want auto-deploy on every commit (and you've made master a deploy
+#  branch rather than a sync-with-upstream branch).
+# ====================================================================
+
+name: Deploy AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_recreate:
+        description: "Force-recreate the container even with no image change"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-aws
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve env
+        id: env
+        run: |
+          echo "short_sha=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          echo "tag_latest=master-latest"   >> "$GITHUB_OUTPUT"
+          echo "tag_sha=master-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: |
+            ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPO }}:${{ steps.env.outputs.tag_latest }}
+            ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPO }}:${{ steps.env.outputs.tag_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Generate the deploy script on the runner, base64-encode it, and hand
+      # ONE command to SSM that decodes and runs it. Avoids shell-quoting hell.
+      - name: Build deploy script
+        id: script
+        env:
+          REGISTRY: ${{ vars.ECR_REGISTRY }}
+          REPO: ${{ vars.ECR_REPO }}
+          TAG: ${{ steps.env.outputs.tag_latest }}
+          REGION: ${{ vars.AWS_REGION }}
+          PUBLIC_URL: ${{ vars.PAPERCLIP_PUBLIC_URL }}
+          DB_SECRET: intellova/paperclip/db
+          AUTH_SECRET_ID: intellova/paperclip/auth
+          CF_TUNNEL_SECRET: intellova/paperclip/cf-tunnel-token
+          FORCE_RECREATE: ${{ inputs.force_recreate || 'true' }}
+        run: |
+          cat > /tmp/deploy.sh <<BASH
+          #!/bin/bash
+          set -euo pipefail
+          APP_DIR=/home/ubuntu/paperclip
+          DATA_DIR=/opt/paperclip-data
+          mkdir -p "\$APP_DIR"
+          cd "\$APP_DIR"
+
+          # ── Fetch DB connection JSON, build DATABASE_URL ────────────────
+          DB_JSON=\$(aws secretsmanager get-secret-value --region "${REGION}" \
+            --secret-id "${DB_SECRET}" --query SecretString --output text)
+          DB_HOST=\$(echo "\$DB_JSON" | jq -r .host)
+          DB_PORT=\$(echo "\$DB_JSON" | jq -r .port)
+          DB_NAME=\$(echo "\$DB_JSON" | jq -r .dbname)
+          DB_USER=\$(echo "\$DB_JSON" | jq -r .username)
+          DB_PASS=\$(echo "\$DB_JSON" | jq -r .password | python3 -c \
+            "import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read().rstrip('\\n'), safe=''))")
+          DATABASE_URL="postgresql://\${DB_USER}:\${DB_PASS}@\${DB_HOST}:\${DB_PORT}/\${DB_NAME}"
+
+          # ── Better Auth secret ──────────────────────────────────────────
+          AUTH_JSON=\$(aws secretsmanager get-secret-value --region "${REGION}" \
+            --secret-id "${AUTH_SECRET_ID}" --query SecretString --output text)
+          BETTER_AUTH_SECRET=\$(echo "\$AUTH_JSON" | jq -r .BETTER_AUTH_SECRET)
+
+          # ── Compose file (idempotent rewrite) ───────────────────────────
+          cat > docker-compose.yml <<YAML
+          services:
+            paperclip:
+              image: ${REGISTRY}/${REPO}:${TAG}
+              container_name: paperclip
+              restart: unless-stopped
+              # Loopback only — Cloudflare Tunnel reaches us at 127.0.0.1:3100.
+              ports:
+                - "127.0.0.1:3100:3100"
+              volumes:
+                - ${DATA_DIR}:/paperclip
+              environment:
+                NODE_ENV: production
+                HOST: "0.0.0.0"
+                PORT: "3100"
+                PAPERCLIP_HOME: /paperclip
+                PAPERCLIP_INSTANCE_ID: default
+                # Public, authenticated mode behind the Cloudflare Tunnel.
+                PAPERCLIP_DEPLOYMENT_MODE: authenticated
+                PAPERCLIP_DEPLOYMENT_EXPOSURE: public
+                PAPERCLIP_PUBLIC_URL: "${PUBLIC_URL}"
+                # Sign-up gate. After the first user signs up (= admin), set
+                # this to "true" via repo Actions vars and re-run to lock down.
+                PAPERCLIP_AUTH_DISABLE_SIGN_UP: "${{ vars.PAPERCLIP_AUTH_DISABLE_SIGN_UP || 'false' }}"
+                # Auth + DB
+                BETTER_AUTH_SECRET: "\${BETTER_AUTH_SECRET}"
+                DATABASE_URL: "\${DATABASE_URL}"
+                # Subscription mode for Claude — ANTHROPIC_API_KEY is intentionally
+                # NOT set so the claude-local adapter falls back to the OAuth
+                # creds in /paperclip/.claude/credentials.json. If you ever want
+                # API-key billing, add an Actions var ANTHROPIC_API_KEY_SECRET_ID
+                # and read it from Secrets Manager here.
+          YAML
+          chown ubuntu:ubuntu docker-compose.yml
+
+          # ── Cloudflare Tunnel — install once if a token is in Secrets Manager.
+          # Skip silently if the secret doesn't exist yet (first run before the
+          # CF dashboard tunnel was created).
+          if ! systemctl is-active --quiet cloudflared; then
+            if aws secretsmanager describe-secret --region "${REGION}" \
+                 --secret-id "${CF_TUNNEL_SECRET}" >/dev/null 2>&1; then
+              CF_TOKEN=\$(aws secretsmanager get-secret-value --region "${REGION}" \
+                --secret-id "${CF_TUNNEL_SECRET}" --query SecretString --output text \
+                | jq -r 'if type=="object" then .token else . end')
+              cloudflared service install "\$CF_TOKEN"
+            else
+              echo "[deploy] no cloudflared token yet (secret ${CF_TUNNEL_SECRET}); skipping tunnel install"
+            fi
+          fi
+
+          # ── Pull + start ────────────────────────────────────────────────
+          aws ecr get-login-password --region ${REGION} \
+            | docker login --username AWS --password-stdin ${REGISTRY}
+          docker compose pull
+          if [ "${FORCE_RECREATE}" = "true" ]; then
+            docker compose up -d --force-recreate
+          else
+            docker compose up -d
+          fi
+          docker image prune -f
+          docker compose ps
+          BASH
+          B64=$(base64 -w0 /tmp/deploy.sh)
+          echo "b64=$B64" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to EC2 via SSM
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          B64: ${{ steps.script.outputs.b64 }}
+        run: |
+          set -euo pipefail
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"echo $B64 | base64 -d | sudo -E bash\"]" \
+            --timeout-seconds 900 \
+            --query 'Command.CommandId' --output text)
+          echo "SSM command: $CMD_ID"
+
+          for i in $(seq 1 90); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success)
+                echo "::group::deploy stdout"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text | tail -80
+                echo "::endgroup::"
+                exit 0 ;;
+              Failed|Cancelled|TimedOut)
+                echo "::error::SSM deploy status: $STATUS"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' --output text
+                exit 1 ;;
+              *) echo "[$i/90] $STATUS"; sleep 10 ;;
+            esac
+          done
+          echo "::error::timed out waiting for SSM command"
+          exit 1
+
+      - name: Smoke check via SSM (loopback)
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["sleep 8 && curl -sf -o /dev/null -w \"local /api/health = %{http_code}\\n\" http://127.0.0.1:3100/api/health || true","sudo docker logs --tail 30 paperclip 2>&1 | tail -30"]' \
+            --query 'Command.CommandId' --output text)
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] && break
+            sleep 5
+          done
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text
