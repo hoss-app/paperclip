@@ -127,7 +127,7 @@ jobs:
               ports:
                 - "127.0.0.1:3100:3100"
               volumes:
-                - ${DATA_DIR}:/paperclip
+                - \${DATA_DIR}:/paperclip
               environment:
                 NODE_ENV: production
                 HOST: "0.0.0.0"
