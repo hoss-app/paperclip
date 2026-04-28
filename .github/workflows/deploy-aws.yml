@@ -109,7 +109,11 @@ jobs:
           DB_USER=\$(echo "\$DB_JSON" | jq -r .username)
           DB_PASS=\$(echo "\$DB_JSON" | jq -r .password | python3 -c \
             "import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read().rstrip('\\n'), safe=''))")
-          DATABASE_URL="postgresql://\${DB_USER}:\${DB_PASS}@\${DB_HOST}:\${DB_PORT}/\${DB_NAME}"
+          # ?sslmode=require — RDS pg_hba.conf rejects unencrypted connections
+          # ("no encryption" auth error). Paperclip uses postgres.js which honors
+          # this URL flag (unlike in-app's node-postgres which sets SSL via Pool
+          # config). require = encrypted, no cert verification (fine for in-VPC).
+          DATABASE_URL="postgresql://\${DB_USER}:\${DB_PASS}@\${DB_HOST}:\${DB_PORT}/\${DB_NAME}?sslmode=require"
 
           # ── Better Auth secret ──────────────────────────────────────────
           AUTH_JSON=\$(aws secretsmanager get-secret-value --region "${REGION}" \
